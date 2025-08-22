@@ -2,7 +2,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import pandas as pd
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from utils_finance import clean_text, tokenize
@@ -82,20 +81,14 @@ class CorpusIndex:
         self.bm25_S = BM25Okapi(self.tokens_S) if len(self.tokens_S) else None
         self.bm25_L = BM25Okapi(self.tokens_L) if len(self.tokens_L) else None
 
-    def build_dense(self):
-        if self.S is None or self.L is None:
-            raise RuntimeError("Call chunk_docs() first.")
+    def build_dense(self, chunks: pd.DataFrame):
         self.emb_model = SentenceTransformer(self.cfg.embed_model)
-        if len(self.S):
-            embs_S = self.emb_model.encode(self.S.text.tolist(), show_progress_bar=False, normalize_embeddings=True)
-            self.dense_matrix_S = np.array(embs_S, dtype=np.float32)
-            self.nn_S = NearestNeighbors(n_neighbors=min(self.cfg.top_k_dense, len(self.S)), metric="cosine")
-            self.nn_S.fit(self.dense_matrix_S)
-        if len(self.L):
-            embs_L = self.emb_model.encode(self.L.text.tolist(), show_progress_bar=False, normalize_embeddings=True)
-            self.dense_matrix_L = np.array(embs_L, dtype=np.float32)
-            self.nn_L = NearestNeighbors(n_neighbors=min(self.cfg.top_k_dense, len(self.L)), metric="cosine")
-            self.nn_L.fit(self.dense_matrix_L)
+        embs = self.emb_model.encode(
+            chunks.text.tolist(), show_progress_bar=False, normalize_embeddings=True
+        )
+        # store normalized embeddings (L2=1) -> cosine = dot product
+        self.dense_matrix = np.asarray(embs, dtype=np.float32)
+
 
     def ensure_reranker(self):
         if self.cross_encoder is None:
@@ -114,17 +107,17 @@ class CorpusIndex:
             return [(int(i), float(scores[i])) for i in idx]
         return []
 
-    def _dense_top(self, query: str, which: str):
-        q = self.emb_model.encode([query], show_progress_bar=False, normalize_embeddings=True)
-        if which == "S" and self.nn_S is not None:
-            dists, idxs = self.nn_S.kneighbors(q, n_neighbors=min(self.cfg.top_k_dense, len(self.S)))
-            sims = 1 - dists[0]
-            return [(int(i), float(s)) for i, s in zip(idxs[0], sims)]
-        if which == "L" and self.nn_L is not None:
-            dists, idxs = self.nn_L.kneighbors(q, n_neighbors=min(self.cfg.top_k_dense, len(self.L)))
-            sims = 1 - dists[0]
-            return [(int(i), float(s)) for i, s in zip(idxs[0], sims)]
-        return []
+    def _dense_top(self, query: str, chunks: pd.DataFrame):
+        # encode + normalize (sentence-transformers normalize_embeddings=True already)
+        q = self.emb_model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
+        q = np.asarray(q, dtype=np.float32)
+        sims = (self.dense_matrix @ q)  # cosine because both are normalized
+        k = min(self.cfg.top_k_dense, len(chunks))
+        if k <= 0:
+            return []
+        top_idx = np.argpartition(-sims, k-1)[:k]
+        top_idx = top_idx[np.argsort(-sims[top_idx])]
+        return [(int(i), float(sims[i])) for i in top_idx]
 
     def stage1_candidates(self, query: str):
         S_bm25 = self._bm25_top(query, "S")

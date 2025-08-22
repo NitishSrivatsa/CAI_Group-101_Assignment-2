@@ -34,8 +34,6 @@ class CorpusIndex:
         self.emb_model = None
         self.dense_matrix_S = None
         self.dense_matrix_L = None
-        self.nn_S = None
-        self.nn_L = None
         self.cross_encoder = None
         self.S = None
         self.L = None

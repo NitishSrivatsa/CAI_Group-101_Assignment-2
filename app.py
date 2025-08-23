@@ -439,17 +439,18 @@ if run:
             with st.expander("Retrieved context"):
                 for i, t in enumerate(res["contexts"], 1):
                     st.markdown(f"**{i}.** {t[:1500]}{'...' if len(t)>1500 else ''}")
-# ================== Evaluation & Comparison ==================
+# ================== Evaluation & Comparison (guarded) ==================
 import time as _time
 import pandas as _pd
 import io as _io
 import json as _json
+from typing import Optional
 
 st.markdown("---")
 st.header("Evaluation — Side-by-Side")
 
 with st.expander("Configure test set"):
-    st.write("Enter questions (one per line). Provide optional ground-truth as JSON (key: exact question, value: expected answer).")
+    st.write("Enter questions (one per line). Provide optional ground-truth as JSON (key: exact question, value: expected answer substring).")
     default_questions = """\
 What was Intel's revenue in 2023?
 What was Intel's revenue in 2024?
@@ -462,52 +463,79 @@ What is the capital of France?"""
         GROUND_TRUTH = _json.loads(gt_text or "{}")
     except Exception:
         GROUND_TRUTH = {}
+    run_rag = st.checkbox("Run RAG", value=True)
+    run_ft  = st.checkbox("Run Fine-Tuned", value=True)
+    run_eval = st.button("Run evaluation")
 
-    run_eval = st.button("Run evaluation on both methods")
+def _contains(ans: Optional[str], truth: Optional[str]) -> str:
+    if not truth: return ""
+    if not ans: return "N"
+    return "Y" if truth.lower() in ans.lower() else "N"
 
 if run_eval:
     prepare_artifacts()
-    rows = []
     questions = [q.strip() for q in qs_text.splitlines() if q.strip()]
+    if not questions:
+        st.warning("No questions provided.")
+    else:
+        rows = []
+        prog = st.progress(0)
+        total_tasks = len(questions) * (1 if (run_rag ^ run_ft) else 2 if (run_rag and run_ft) else 0)
+        done = 0
 
-    for q_ in questions:
-        # RAG
-        t0 = _time.time()
-        res_rag = rag_pipeline(q_, k_dense, k_sparse, keep_ctx)
-        res_rag = output_guard(res_rag)
-        t_rag = round(_time.time() - t0, 3)
+        for q_ in questions:
+            gt = GROUND_TRUTH.get(q_, None)
 
-        # FT
-        t0 = _time.time()
-        res_ft = ft_pipeline(q_)
-        t_ft = round(_time.time() - t0, 3)
+            # --- RAG (guarded) ---
+            if run_rag:
+                t0 = _time.time()
+                try:
+                    res_rag = rag_pipeline(q_, k_dense, k_sparse, keep_ctx)
+                    res_rag = output_guard(res_rag)
+                    err = ""
+                except Exception as e:
+                    res_rag = {"answer": "", "confidence": None, "method": "RAG (Multi-Stage)", "time_s": round(_time.time()-t0,3)}
+                    err = f"RAG error: {e}"
+                t_rag = round(_time.time() - t0, 3)
+                rows.append({
+                    "Question": q_,
+                    "Method": "RAG",
+                    "Answer": (res_rag.get("answer") or err)[:2000],
+                    "Confidence": res_rag.get("confidence"),
+                    "Time (s)": t_rag,
+                    "Correct (Y/N)": _contains(res_rag.get("answer"), gt)
+                })
+                done += 1
+                prog.progress(min(1.0, done / max(1, total_tasks)))
 
-        # correctness (simple contains check, case-insensitive), only if ground truth provided
-        gt = GROUND_TRUTH.get(q_)
-        def _is_correct(ans: str, truth: str | None):
-            if not truth: return ""
-            return "Y" if truth.lower() in (ans or "").lower() else "N"
+            # --- FT (guarded) ---
+            if run_ft:
+                t0 = _time.time()
+                try:
+                    res_ft = ft_pipeline(q_)
+                    err = ""
+                except Exception as e:
+                    res_ft = {"answer":"", "confidence": None, "method":"FT (Supervised Instruction Fine-Tuning)", "time_s": round(_time.time()-t0,3)}
+                    err = f"FT error: {e}"
+                t_ft = round(_time.time() - t0, 3)
+                rows.append({
+                    "Question": q_,
+                    "Method": "Fine-Tune",
+                    "Answer": (res_ft.get("answer") or err)[:2000],
+                    "Confidence": res_ft.get("confidence"),
+                    "Time (s)": t_ft,
+                    "Correct (Y/N)": _contains(res_ft.get("answer"), gt)
+                })
+                done += 1
+                prog.progress(min(1.0, done / max(1, total_tasks)))
 
-        rows.append({
-            "Question": q_,
-            "Method": "RAG",
-            "Answer": res_rag["answer"],
-            "Confidence": res_rag.get("confidence"),
-            "Time (s)": t_rag,
-            "Correct (Y/N)": _is_correct(res_rag["answer"], gt)
-        })
-        rows.append({
-            "Question": q_,
-            "Method": "Fine-Tune",
-            "Answer": res_ft["answer"],
-            "Confidence": res_ft.get("confidence"),
-            "Time (s)": t_ft,
-            "Correct (Y/N)": _is_correct(res_ft["answer"], gt)
-        })
+        df = _pd.DataFrame(rows, columns=["Question","Method","Answer","Confidence","Time (s)","Correct (Y/N)"])
+        st.dataframe(df, use_container_width=True)
 
-    df = _pd.DataFrame(rows, columns=["Question","Method","Answer","Confidence","Time (s)","Correct (Y/N)"])
-    st.dataframe(df, use_container_width=True)
-
-    # Download button
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download results.csv", data=csv_bytes, file_name="results.csv", mime="text/csv")
+        # Download
+        st.download_button(
+            "Download results.csv",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="results.csv",
+            mime="text/csv"
+        )

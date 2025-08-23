@@ -439,3 +439,75 @@ if run:
             with st.expander("Retrieved context"):
                 for i, t in enumerate(res["contexts"], 1):
                     st.markdown(f"**{i}.** {t[:1500]}{'...' if len(t)>1500 else ''}")
+# ================== Evaluation & Comparison ==================
+import time as _time
+import pandas as _pd
+import io as _io
+import json as _json
+
+st.markdown("---")
+st.header("Evaluation — Side-by-Side")
+
+with st.expander("Configure test set"):
+    st.write("Enter questions (one per line). Provide optional ground-truth as JSON (key: exact question, value: expected answer).")
+    default_questions = """\
+What was Intel's revenue in 2023?
+What was Intel's revenue in 2024?
+What was Intel's net income in 2023?
+What were Intel's operating expenses in 2024?
+What is the capital of France?"""
+    qs_text = st.text_area("Questions", value=default_questions, height=160)
+    gt_text = st.text_area("Ground truth JSON (optional)", value="{}", height=120)
+    try:
+        GROUND_TRUTH = _json.loads(gt_text or "{}")
+    except Exception:
+        GROUND_TRUTH = {}
+
+    run_eval = st.button("Run evaluation on both methods")
+
+if run_eval:
+    prepare_artifacts()
+    rows = []
+    questions = [q.strip() for q in qs_text.splitlines() if q.strip()]
+
+    for q_ in questions:
+        # RAG
+        t0 = _time.time()
+        res_rag = rag_pipeline(q_, k_dense, k_sparse, keep_ctx)
+        res_rag = output_guard(res_rag)
+        t_rag = round(_time.time() - t0, 3)
+
+        # FT
+        t0 = _time.time()
+        res_ft = ft_pipeline(q_)
+        t_ft = round(_time.time() - t0, 3)
+
+        # correctness (simple contains check, case-insensitive), only if ground truth provided
+        gt = GROUND_TRUTH.get(q_)
+        def _is_correct(ans: str, truth: str | None):
+            if not truth: return ""
+            return "Y" if truth.lower() in (ans or "").lower() else "N"
+
+        rows.append({
+            "Question": q_,
+            "Method": "RAG",
+            "Answer": res_rag["answer"],
+            "Confidence": res_rag.get("confidence"),
+            "Time (s)": t_rag,
+            "Correct (Y/N)": _is_correct(res_rag["answer"], gt)
+        })
+        rows.append({
+            "Question": q_,
+            "Method": "Fine-Tune",
+            "Answer": res_ft["answer"],
+            "Confidence": res_ft.get("confidence"),
+            "Time (s)": t_ft,
+            "Correct (Y/N)": _is_correct(res_ft["answer"], gt)
+        })
+
+    df = _pd.DataFrame(rows, columns=["Question","Method","Answer","Confidence","Time (s)","Correct (Y/N)"])
+    st.dataframe(df, use_container_width=True)
+
+    # Download button
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download results.csv", data=csv_bytes, file_name="results.csv", mime="text/csv")

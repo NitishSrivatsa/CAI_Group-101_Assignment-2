@@ -319,16 +319,37 @@ def rag_pipeline(query: str, k_dense: int, k_sparse: int, keep_ctx: int):
         "contexts": ctx
     }
 
-def ft_pipeline(query: str):
+def ft_pipeline(query: str, max_new_tokens: int = 120) -> dict:
+    """
+    Fine-tuned (Supervised Instruction FT) inference.
+    Prompts the model with 'Question: ...\\nAnswer:' to match training format.
+    """
     t0 = time.time()
-    ans = generate_with_ft(query, max_new_tokens=160)
+    # Instruction-style prompt (matches typical SFT data)
+    prompt = f"Question: {query}\nAnswer:"
+
+    # Generate deterministically (generate_with_ft already sets do_sample=False and token budget)
+    raw = generate_with_ft(prompt, max_new_tokens=max_new_tokens)
+
+    # Heuristic: if model echoed the question/prompt, keep only content after 'Answer:'.
+    anchor = "Answer:"
+    ans = raw
+    if anchor in raw:
+        cut = raw.rfind(anchor)
+        ans = raw[cut + len(anchor):].strip()
+
+    # Minimal fallback
+    if not ans:
+        ans = "I'm not confident about the answer based on the fine-tuned model alone."
+
     return {
         "answer": ans,
-        "confidence": None,
+        "confidence": None,  # FT path has no retrieval score
         "method": "FT (Supervised Instruction Fine-Tuning)",
         "time_s": round(time.time() - t0, 3),
         "contexts": []
     }
+
 
 # ====== Guardrails ======
 def input_guard(q: str) -> Tuple[bool, str]:

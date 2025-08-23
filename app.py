@@ -108,8 +108,31 @@ def load_rag_components():
 
 @st.cache_resource(show_spinner=False)
 def load_reranker(model_name: str):
+    # Robust CrossEncoder loader: ensures pad token and aligned vocab/embeddings
     from sentence_transformers import CrossEncoder
-    return CrossEncoder(model_name)
+
+    ce = CrossEncoder(model_name, max_length=512)  # downloads once, caches on disk
+    tok = ce.tokenizer
+
+    # Guarantee a pad token (common cause of IndexError)
+    if tok.pad_token is None:
+        if tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
+        else:
+            tok.add_special_tokens({"pad_token": "[PAD]"})
+
+    try:
+        # If tokenizer length != embedding rows, align them
+        vocab_n = len(tok)
+        emb_n = ce.model.get_input_embeddings().weight.shape[0]
+        if vocab_n != emb_n:
+            ce.model.resize_token_embeddings(vocab_n)
+        ce.model.config.pad_token_id = tok.pad_token_id
+    except Exception:
+        pass
+
+    return ce
+
 
 # ===== Utils =====
 FIN_KWS = {
@@ -157,14 +180,20 @@ def stage1_retrieve(query: str, k_dense: int, k_sparse: int):
     fused = fuse_scores(dense, sparse, w_dense=0.6, w_sparse=0.4, top_k=max(k_dense, k_sparse))
     return fused, passages
 
-def stage2_rerank(query: str, cand_ids: List[int], passages: List[Dict[str,Any]], keep_top: int):
-    _, _, _, _, rr_name = load_rag_components()
-    reranker = load_reranker(rr_name)
-    pairs = [(query, passages[i]["text"]) for i in cand_ids]
-    scores = reranker.predict(pairs)
-    order = list(sorted(range(len(scores)), key=lambda j: float(scores[j]), reverse=True))[:keep_top]
-    ranked = [(cand_ids[j], float(scores[j])) for j in order]
-    return ranked
+def stage2_rerank(query: str, cand_ids: List[int], passages: List[Dict[str,Any]], keep_top=5):
+    # Try CrossEncoder; if it fails, fall back to Stage-1 order (still Multi-Stage, with warning)
+    try:
+        _, _, _, _, rr_name = load_rag_components()
+        reranker = load_reranker(rr_name)
+        pairs = [(query, passages[i]["text"]) for i in cand_ids]
+        # limit batch size to avoid OOM
+        scores = reranker.predict(pairs, convert_to_numpy=True, batch_size=16, show_progress_bar=False)
+        order = list(sorted(range(len(scores)), key=lambda j: float(scores[j]), reverse=True))[:keep_top]
+        return [(cand_ids[j], float(scores[j])) for j in order]
+    except Exception as e:
+        st.warning(f"Cross-encoder rerank failed ({e}); using Stage-1 fused order as fallback.")
+        return [(i, 0.0) for i in cand_ids[:keep_top]]
+
 
 def build_prompt(query: str, ctx_texts: List[str], max_ctx_chars=6000):
     buf = ""

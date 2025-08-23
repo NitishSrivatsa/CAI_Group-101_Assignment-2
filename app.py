@@ -50,18 +50,51 @@ def prepare_artifacts():
 # ===== Loaders =====
 @st.cache_resource(show_spinner=False)
 def load_ft_pipeline():
-    from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
-    cfg = AutoConfig.from_pretrained(FT_DST)
-    tok = AutoTokenizer.from_pretrained(FT_DST)
+    from transformers import (
+        AutoConfig, AutoTokenizer,
+        AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
+    )
+
+    cfg = AutoConfig.from_pretrained(FT_DST, trust_remote_code=False)
+    tok = AutoTokenizer.from_pretrained(FT_DST, use_fast=True, trust_remote_code=False)
+
+    # Ensure pad/eos tokens exist (GPT-2 often lacks pad)
+    if tok.pad_token is None:
+        if tok.eos_token:
+            tok.pad_token = tok.eos_token
+        else:
+            tok.add_special_tokens({"pad_token": "[PAD]"})
+    if tok.eos_token is None:
+        tok.add_special_tokens({"eos_token": "</s>"})
+
+    # Load model, tolerate small size mismatches
     if getattr(cfg, "is_encoder_decoder", False):
-        mdl = AutoModelForSeq2SeqLM.from_pretrained(FT_DST)
-        pipe = pipeline("text2text-generation", model=mdl, tokenizer=tok, device_map="auto")
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(FT_DST, ignore_mismatched_sizes=True)
         kind = "seq2seq"
     else:
-        mdl = AutoModelForCausalLM.from_pretrained(FT_DST)
-        pipe = pipeline("text-generation", model=mdl, tokenizer=tok, device_map="auto")
+        mdl = AutoModelForCausalLM.from_pretrained(FT_DST, ignore_mismatched_sizes=True)
         kind = "causal"
-    return pipe, kind
+
+    # Align embedding rows with tokenizer length (defensive)
+    try:
+        if mdl.get_input_embeddings().weight.shape[0] != len(tok):
+            mdl.resize_token_embeddings(len(tok))
+    except Exception:
+        pass
+
+    # Configure padding and max positions
+    mdl.config.pad_token_id = tok.pad_token_id
+    max_pos = getattr(mdl.config, "max_position_embeddings", None) or getattr(mdl.config, "n_positions", 1024)
+    # enforce tokenizer's truncation boundary (pipelines use this)
+    tok.model_max_length = max_pos
+
+    # Build pipeline
+    task = "text2text-generation" if kind == "seq2seq" else "text-generation"
+    gen = pipeline(task, model=mdl, tokenizer=tok, device_map="auto")
+    # Conservative defaults
+    try:
+        gen.model.generation_config.do_sample = False
+
 
 @st.cache_resource(show_spinner=False)
 def load_rag_components():
@@ -195,37 +228,94 @@ def stage2_rerank(query: str, cand_ids: List[int], passages: List[Dict[str,Any]]
         return [(i, 0.0) for i in cand_ids[:keep_top]]
 
 
-def build_prompt(query: str, ctx_texts: List[str], max_ctx_chars=6000):
-    buf = ""
+def build_prompt(query: str, ctx_texts: list[str], token_budget: int, tokenizer) -> str:
+    """
+    Packs as many context chunks as will fit within the token budget.
+    Budget excludes space reserved for the question and answer tokens.
+    """
+    prefix = "Context:\n"
+    suffix = f"\nQuestion: {query}\nAnswer:"
+    # Start with no context, add until budget is hit
+    packed = []
+    # Reserve tokens for suffix
+    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+    used = len(tokenizer.encode(prefix, add_special_tokens=False)) + len(suffix_ids)
     for t in ctx_texts:
-        if len(buf) + len(t) + 2 > max_ctx_chars: break
-        buf += t + "\n\n"
-    return f"Context:\n{buf}\nQuestion: {query}\nAnswer:"
+        t_ids = tokenizer.encode(t + "\n\n", add_special_tokens=False)
+        if used + len(t_ids) > token_budget:
+            break
+        packed.append(t)
+        used += len(t_ids)
+    return prefix + "\n\n".join(packed) + suffix
 
 def generate_with_ft(prompt: str, max_new_tokens=160) -> str:
-    pipe, kind = load_ft_pipeline()
-    return pipe(prompt, max_new_tokens=max_new_tokens, do_sample=False)[0]["generated_text"]
+    gen, kind = load_ft_pipeline()
+    tok = gen.tokenizer
+    mdl = gen.model
+    max_pos = getattr(mdl.config, "max_position_embeddings", None) or getattr(mdl.config, "n_positions", 1024)
+
+    # Keep some headroom for new tokens and safety margin
+    safety = 16
+    input_budget = max(32, max_pos - max_new_tokens - safety)
+
+    # Truncate prompt by tokens to the budget, to avoid position overflow
+    ids = tok.encode(prompt, add_special_tokens=False)
+    ids = ids[-input_budget:]  # keep the tail (usually contains the question + latest context)
+    inputs = tok.encode_plus(
+        ids, is_split_into_words=False, return_tensors="pt", add_special_tokens=False,
+        truncation=True, max_length=input_budget, padding=False
+    )
+    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+
+    # Generate deterministically (no temperature)
+    out = mdl.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tok.pad_token_id,
+        eos_token_id=tok.eos_token_id,
+    )
+    text = tok.decode(out[0], skip_special_tokens=True)
+
+    # Heuristic: return only the segment after "Answer:" if present
+    if "Answer:" in prompt:
+        # strip the prompt part if it's echoed
+        i = text.rfind("Answer:")
+        if i != -1:
+            return text[i+len("Answer:"):].strip()
+    return text.strip()
+
 
 def rag_pipeline(query: str, k_dense: int, k_sparse: int, keep_ctx: int):
     t0 = time.time()
     fused, passages = stage1_retrieve(query, k_dense, k_sparse)
     if not fused:
         return {"answer":"No relevant context retrieved.", "confidence":0.2, "method":"RAG (Multi-Stage)", "time_s":round(time.time()-t0,3), "contexts":[]}
-    cand_ids = [i for i,_ in fused[:max(k_dense,k_sparse)]]
+    cand_ids = [i for i,_ in fused[:max(k_dense, k_sparse)]]
     reranked = stage2_rerank(query, cand_ids, passages, keep_top=keep_ctx)
     ctx = [passages[i]["text"] for i,_ in reranked]
+
+    # confidence from reranker
     s = [sc for _, sc in reranked]
     import math
-    avg3 = sum(s[:3])/max(1,min(3,len(s)))
+    avg3 = sum(s[:3])/max(1, min(3, len(s)))
     conf = 1/(1+math.exp(-avg3))
-    ans = generate_with_ft(build_prompt(query, ctx))
+
+    # token-budgeted prompt
+    gen, _ = load_ft_pipeline()
+    token_budget = getattr(gen.model.config, "max_position_embeddings", None) or getattr(gen.model.config, "n_positions", 1024)
+    token_budget = max(64, token_budget - 176)  # reserve ~176 tokens for Q&A/new tokens
+    prompt = build_prompt(query, ctx, token_budget, gen.tokenizer)
+
+    ans = generate_with_ft(prompt, max_new_tokens=160)
     return {
         "answer": ans,
-        "confidence": round(float(conf),3),
+        "confidence": round(float(conf), 3),
         "method": "RAG (Multi-Stage: Stage-1 Dense+Sparse → Stage-2 Cross-Encoder)",
-        "time_s": round(time.time()-t0,3),
+        "time_s": round(time.time() - t0, 3),
         "contexts": ctx
     }
+
 
 def ft_pipeline(query: str):
     t0 = time.time()

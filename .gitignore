@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+artifacts/rag_index/
+artifacts/ft_model/
+artifacts/tmp/
+!.gitattributes

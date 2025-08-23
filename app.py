@@ -440,10 +440,12 @@ if run:
                 for i, t in enumerate(res["contexts"], 1):
                     st.markdown(f"**{i}.** {t[:1500]}{'...' if len(t)>1500 else ''}")
 # ================== Evaluation & Comparison (guarded) ==================
+# ================== Evaluation & Comparison (guarded + Arrow-safe) ==================
 import time as _time
 import pandas as _pd
 import io as _io
 import json as _json
+import numpy as _np
 from typing import Optional
 
 st.markdown("---")
@@ -471,6 +473,16 @@ def _contains(ans: Optional[str], truth: Optional[str]) -> str:
     if not truth: return ""
     if not ans: return "N"
     return "Y" if truth.lower() in ans.lower() else "N"
+
+def _to_scalar(x):
+    # Arrow-safe: no lists/tuples/dicts/None
+    if x is None:
+        return _np.nan
+    if isinstance(x, (list, tuple, set)):
+        return "; ".join(map(str, x))
+    if isinstance(x, dict):
+        return _json.dumps(x, ensure_ascii=False)
+    return x
 
 if run_eval:
     prepare_artifacts()
@@ -529,10 +541,17 @@ if run_eval:
                 done += 1
                 prog.progress(min(1.0, done / max(1, total_tasks)))
 
+        # ---- Build Arrow-safe DataFrame ----
         df = _pd.DataFrame(rows, columns=["Question","Method","Answer","Confidence","Time (s)","Correct (Y/N)"])
-        st.dataframe(df, use_container_width=True)
 
-        # Download
+        # Normalize columns to scalars Arrow can handle
+        for col in ["Question", "Method", "Answer", "Correct (Y/N)"]:
+            df[col] = df[col].map(_to_scalar).astype("string")
+        for col in ["Confidence", "Time (s)"]:
+            df[col] = _pd.to_numeric(df[col].map(_to_scalar), errors="coerce")
+
+        # Render + Download
+        st.dataframe(df, use_container_width=True)
         st.download_button(
             "Download results.csv",
             data=df.to_csv(index=False).encode("utf-8"),

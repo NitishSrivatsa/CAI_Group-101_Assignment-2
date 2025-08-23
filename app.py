@@ -251,8 +251,11 @@ def build_prompt(query: str, ctx_texts: List[str], token_budget: int, tokenizer)
         used += len(t_ids)
     return prefix + "\n\n".join(packed) + suffix
 
-def generate_with_ft(prompt: str, max_new_tokens=160) -> str:
-    # Use token-budgeted prompt; feed raw IDs to model to avoid encode_plus type errors.
+def generate_with_ft(prompt: str, max_new_tokens=160) -> tuple[str, float | None]:
+    """
+    Deterministic generation + confidence ~ mean token probability of the generated span.
+    Returns (answer_text, confidence ∈ [0,1] or None).
+    """
     gen, _ = load_ft_pipeline()
     tok = gen.tokenizer
     mdl = gen.model
@@ -261,14 +264,11 @@ def generate_with_ft(prompt: str, max_new_tokens=160) -> str:
     safety = 16
     input_budget = max(32, max_pos - max_new_tokens - safety)
 
-    # Tokenize -> clamp to budget
-    ids = tok.encode(prompt, add_special_tokens=False)
-    if not ids:
-        ids = tok.encode("Answer:", add_special_tokens=False)
-    ids = ids[-input_budget:]  # keep tail to prioritize the question + latest context
+    # Tokenize prompt and clamp length
+    ids = tok.encode(prompt, add_special_tokens=False) or tok.encode("Answer:", add_special_tokens=False)
+    ids = ids[-input_budget:]
 
-    # === KEY FIX: pass tensors directly (not encode_plus on IDs) ===
-    import torch
+    import torch, math
     device = mdl.device
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_ids, device=device)
@@ -280,13 +280,31 @@ def generate_with_ft(prompt: str, max_new_tokens=160) -> str:
         do_sample=False,
         pad_token_id=tok.pad_token_id,
         eos_token_id=tok.eos_token_id,
+        output_scores=True,
+        return_dict_in_generate=True,
     )
-    text = tok.decode(out[0], skip_special_tokens=True)
 
-    # Return only the part after "Answer:" when present
+    seq = out.sequences[0]
+    gen_len = seq.shape[0] - input_ids.shape[1]
+    text = tok.decode(seq, skip_special_tokens=True)
+
+    # Confidence = exp(mean log-prob of generated tokens)
+    conf = None
+    if out.scores and gen_len > 0:
+        # out.scores is a list[length=gen_len] of [batch, vocab] logits
+        logps = []
+        for step in range(gen_len):
+            logits = out.scores[step][0]                    # [vocab]
+            token_id = seq[input_ids.shape[1] + step].item()
+            logp = torch.log_softmax(logits, dim=-1)[token_id].item()
+            logps.append(logp)
+        conf = float(math.exp(sum(logps) / len(logps))) if logps else None
+
+    # Return only text after "Answer:" when present
     anchor = "Answer:"
     j = text.rfind(anchor)
-    return text[j + len(anchor):].strip() if j != -1 else text.strip()
+    answer = text[j + len(anchor):].strip() if j != -1 else text.strip()
+    return answer, conf
 
 # ====== Pipelines ======
 def rag_pipeline(query: str, k_dense: int, k_sparse: int, keep_ctx: int):
@@ -320,31 +338,14 @@ def rag_pipeline(query: str, k_dense: int, k_sparse: int, keep_ctx: int):
     }
 
 def ft_pipeline(query: str, max_new_tokens: int = 120) -> dict:
-    """
-    Fine-tuned (Supervised Instruction FT) inference.
-    Prompts the model with 'Question: ...\\nAnswer:' to match training format.
-    """
     t0 = time.time()
-    # Instruction-style prompt (matches typical SFT data)
     prompt = f"Question: {query}\nAnswer:"
-
-    # Generate deterministically (generate_with_ft already sets do_sample=False and token budget)
-    raw = generate_with_ft(prompt, max_new_tokens=max_new_tokens)
-
-    # Heuristic: if model echoed the question/prompt, keep only content after 'Answer:'.
-    anchor = "Answer:"
-    ans = raw
-    if anchor in raw:
-        cut = raw.rfind(anchor)
-        ans = raw[cut + len(anchor):].strip()
-
-    # Minimal fallback
+    ans, conf = generate_with_ft(prompt, max_new_tokens=max_new_tokens)
     if not ans:
         ans = "I'm not confident about the answer based on the fine-tuned model alone."
-
     return {
         "answer": ans,
-        "confidence": None,  # FT path has no retrieval score
+        "confidence": None if conf is None else round(float(conf), 3),
         "method": "FT (Supervised Instruction Fine-Tuning)",
         "time_s": round(time.time() - t0, 3),
         "contexts": []

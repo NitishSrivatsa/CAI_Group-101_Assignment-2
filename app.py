@@ -252,33 +252,38 @@ def build_prompt(query: str, ctx_texts: List[str], token_budget: int, tokenizer)
     return prefix + "\n\n".join(packed) + suffix
 
 def generate_with_ft(prompt: str, max_new_tokens=160) -> str:
+    # Use token-budgeted prompt; feed raw IDs to model to avoid encode_plus type errors.
     gen, _ = load_ft_pipeline()
     tok = gen.tokenizer
     mdl = gen.model
-    max_pos = getattr(mdl.config, "max_position_embeddings", None) or getattr(mdl.config, "n_positions", 1024)
 
-    # Keep headroom for generation
+    max_pos = getattr(mdl.config, "max_position_embeddings", None) or getattr(mdl.config, "n_positions", 1024)
     safety = 16
     input_budget = max(32, max_pos - max_new_tokens - safety)
 
-    # Token-truncate to fit
+    # Tokenize -> clamp to budget
     ids = tok.encode(prompt, add_special_tokens=False)
-    ids = ids[-input_budget:]
-    inputs = tok.encode_plus(
-        ids, is_split_into_words=False, return_tensors="pt", add_special_tokens=False,
-        truncation=True, max_length=input_budget, padding=False
-    )
-    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+    if not ids:
+        ids = tok.encode("Answer:", add_special_tokens=False)
+    ids = ids[-input_budget:]  # keep tail to prioritize the question + latest context
+
+    # === KEY FIX: pass tensors directly (not encode_plus on IDs) ===
+    import torch
+    device = mdl.device
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids, device=device)
 
     out = mdl.generate(
-        **inputs,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         pad_token_id=tok.pad_token_id,
         eos_token_id=tok.eos_token_id,
     )
     text = tok.decode(out[0], skip_special_tokens=True)
-    # If the model echoes the prompt, cut to the answer section
+
+    # Return only the part after "Answer:" when present
     anchor = "Answer:"
     j = text.rfind(anchor)
     return text[j + len(anchor):].strip() if j != -1 else text.strip()

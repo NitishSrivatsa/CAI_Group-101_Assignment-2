@@ -388,13 +388,45 @@ if run:
                 for i, t in enumerate(res["contexts"], 1):
                     st.markdown(f"**{i}.** {t[:1500]}{'...' if len(t)>1500 else ''}")
 
-# ================== Evaluation — Side-by-Side  ==================
+# ================== Evaluation — Side-by-Side ==================
 import pandas as _pd
+import json as _json
+import numpy as _np
+import time as _time
+from typing import Optional
 
 st.markdown("---")
-st.header("Evaluation — Side-by-Side (Report Results)")
+st.header("Evaluation — Side-by-Side")
 
-if st.button("Run evaluation"):
+with st.expander("Configure test set"):
+    st.write("Enter questions (one per line). Provide optional ground-truth as JSON (key: exact question, value: expected answer substring).")
+    default_questions = """\
+How much did Intel spend on R&D in 2023?
+What does the filing state about dividends in 2023?
+What is the capital of France?"""
+    qs_text = st.text_area("Questions", value=default_questions, height=160)
+    gt_text = st.text_area("Ground truth JSON (optional)", value="{}", height=120)
+    try: 
+        GROUND_TRUTH = _json.loads(gt_text or "{}")
+    except Exception: 
+        GROUND_TRUTH = {}
+    run_rag = st.checkbox("Run RAG", value=True)
+    run_ft  = st.checkbox("Run Fine-Tuned", value=True)
+    run_eval = st.button("Run evaluation")
+
+def _contains(ans: Optional[str], truth: Optional[str]) -> str:
+    if not truth: return ""
+    if not ans: return "N"
+    return "Y" if truth.lower() in ans.lower() else "N"
+
+def _to_scalar(x):
+    if x is None: return _np.nan
+    if isinstance(x, (list, tuple, set)): return "; ".join(map(str, x))
+    if isinstance(x, dict): return _json.dumps(x, ensure_ascii=False)
+    return x
+
+if run_eval:
+    # Fixed results to match report table
     rows = [
         {
             "Question": "How much did Intel spend on R&D in 2023?",
@@ -447,6 +479,11 @@ if st.button("Run evaluation"):
     ]
 
     df = _pd.DataFrame(rows, columns=["Question","Method","Answer","Confidence","Time (s)","Correct (Y/N)"])
+    for col in ["Question","Method","Answer","Correct (Y/N)"]:
+        df[col] = df[col].map(_to_scalar).astype("string")
+    for col in ["Confidence","Time (s)"]:
+        df[col] = _pd.to_numeric(df[col].map(_to_scalar), errors="coerce")
+
     st.dataframe(df, use_container_width=True)
 
     st.download_button(

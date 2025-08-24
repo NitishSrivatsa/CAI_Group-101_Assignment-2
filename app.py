@@ -388,7 +388,7 @@ if run:
                 for i, t in enumerate(res["contexts"], 1):
                     st.markdown(f"**{i}.** {t[:1500]}{'...' if len(t)>1500 else ''}")
 
-# ================== Evaluation — Side-by-Side (Report Table Style) ==================
+# ================== Evaluation — Side-by-Side  ==================
 import pandas as _pd
 
 st.markdown("---")

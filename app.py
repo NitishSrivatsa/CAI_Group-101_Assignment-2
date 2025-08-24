@@ -485,3 +485,127 @@ if run_eval:
             file_name="results.csv",
             mime="text/csv"
         )
+
+# ================== Extended Evaluation — CSV (10+ Qs, per-method) ==================
+# Append this block at the END of app.py (do not modify earlier code)
+
+import pandas as __pd
+import numpy as __np
+import json as __json
+
+st.markdown("---")
+st.header("Extended Evaluation — CSV (10+ Questions, per method)")
+
+# Discover qa.csvs under artifacts/eval or project root
+EVAL_DIR = ART_DIR / "eval"
+EVAL_DIR.mkdir(parents=True, exist_ok=True)
+__auto_files = sorted(list(EVAL_DIR.glob("*.qa.csv")) + list(APP_DIR.glob("*.qa.csv")))
+
+__options = [str(p.relative_to(APP_DIR)) for p in __auto_files]
+__options = __options if __options else ["Upload..."]
+__choice = st.selectbox("Select QA CSV", options=__options + (["Upload..."] if "Upload..." not in __options else []))
+
+__uploaded = None
+if __choice == "Upload...":
+    __uploaded = st.file_uploader("Upload a QA CSV (columns: Question, Answer)", type=["csv"])
+
+# How many rows to run (default 10)
+__n_rows = st.slider("Number of questions to run", 10, 100, 10, 1)
+
+# Helpers
+def __load_qa_df():
+    if __uploaded is not None:
+        df = __pd.read_csv(__uploaded)
+    else:
+        path = APP_DIR / __choice
+        df = __pd.read_csv(path)
+    # Normalize columns
+    lc = {c.lower(): c for c in df.columns}
+    qcol = lc.get("question") or lc.get("q") or lc.get("questions")
+    acol = lc.get("answer") or lc.get("a") or lc.get("answers")
+    if not qcol or not acol:
+        raise ValueError("CSV must contain 'Question' and 'Answer' columns (case-insensitive).")
+    out = df[[qcol, acol]].rename(columns={qcol: "Question", acol: "Ground Truth"}).copy()
+    out["Question"] = out["Question"].astype(str).str.strip()
+    out["Ground Truth"] = out["Ground Truth"].astype(str).str.strip()
+    out = out[out["Question"] != ""]
+    return out.reset_index(drop=True)
+
+def __contains(ans: Optional[str], truth: Optional[str]) -> str:
+    if not truth: return ""
+    if not ans: return "N"
+    return "Y" if truth.lower() in ans.lower() else "N"
+
+def __to_scalar(x):
+    if x is None: return __np.nan
+    if isinstance(x, (list, tuple, set)): return "; ".join(map(str, x))
+    if isinstance(x, dict): return __json.dumps(x, ensure_ascii=False)
+    return x
+
+# Run controls
+cA, cB = st.columns(2)
+__run_rag_csv = cA.button("Run RAG on CSV")
+__run_ft_csv  = cB.button("Run FT on CSV")
+
+if __run_rag_csv or __run_ft_csv:
+    try:
+        prepare_artifacts()
+        qa_df = __load_qa_df()
+        if len(qa_df) == 0:
+            st.warning("No rows found in CSV.")
+        else:
+            qa_df = qa_df.head(__n_rows)
+            rows: List[Dict[str, Any]] = []
+            prog = st.progress(0)
+            total = len(qa_df)
+
+            for i, row in qa_df.iterrows():
+                q_  = str(row["Question"])
+                gt_ = str(row["Ground Truth"]) if row["Ground Truth"] is not None else ""
+
+                t0 = time.time()
+                if __run_rag_csv:
+                    try:
+                        res = rag_pipeline(q_, k_dense, k_sparse, keep_ctx)
+                        res = output_guard(res)
+                    except Exception as e:
+                        res = {"answer": f"RAG error: {e}", "confidence": None, "method": "RAG (Multi-Stage)", "time_s": round(time.time()-t0,3)}
+                else:
+                    try:
+                        res = ft_pipeline(q_)
+                    except Exception as e:
+                        res = {"answer": f"FT error: {e}", "confidence": None, "method": "FT (Supervised Instruction Fine-Tuning)", "time_s": round(time.time()-t0,3)}
+
+                rows.append({
+                    "Question": q_,
+                    "Ground Truth": gt_,
+                    "Method": res.get("method"),
+                    "Model Answer": res.get("answer"),
+                    "Confidence": res.get("confidence"),
+                    "Time (s)": res.get("time_s"),
+                    "Correct (Y/N)": __contains(res.get("answer"), gt_)
+                })
+                prog.progress(min(1.0, (i + 1) / max(1, total)))
+
+            # Arrow-safe dataframe
+            df_out = __pd.DataFrame(rows, columns=[
+                "Question", "Ground Truth", "Method", "Model Answer", "Confidence", "Time (s)", "Correct (Y/N)"
+            ])
+            for col in ["Question", "Ground Truth", "Method", "Model Answer", "Correct (Y/N)"]:
+                df_out[col] = df_out[col].map(__to_scalar).astype("string")
+            for col in ["Confidence", "Time (s)"]:
+                df_out[col] = __pd.to_numeric(df_out[col].map(__to_scalar), errors="coerce")
+
+            st.dataframe(df_out, use_container_width=True)
+
+            # File name hint
+            __tag = "rag" if __run_rag_csv else "ft"
+            __fname = f"results_{__tag}.csv"
+            st.download_button(
+                f"Download {__fname}",
+                data=df_out.to_csv(index=False).encode("utf-8"),
+                file_name=__fname,
+                mime="text/csv"
+            )
+    except Exception as e:
+        st.error(f"CSV evaluation failed: {e}")
